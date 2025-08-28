@@ -531,4 +531,127 @@ async def on_media_private(client: Client, message: Message):
         return
 
     media = message.video or message.document or message.audio
-    base_name = getattr(media, "file_name", 
+    base_name = getattr(media, "file_name", None) or f"media_{int(time.time())}"
+    chosen = None
+    for r in rules:
+        trig = (r.get("trigger") or "").lower()
+        chans = r.get("channels")
+        # channel scope: if set, only apply when forwarded from/coming from there
+        if chans:
+            if not message.forward_from_chat or message.forward_from_chat.id not in chans:
+                continue
+        if trig and trig in base_name.lower():
+            chosen = r
+            break
+
+    if not chosen:
+        return  # no match, do nothing (use /rename for manual)
+
+    fmt = chosen["format"]
+    new_base = apply_format(fmt, base_name)
+    new_base = safe_filename(new_base)
+    suffix = os.path.splitext(base_name)[1]
+    if suffix and not new_base.lower().endswith(suffix.lower()):
+        out_name = f"{new_base}{suffix}"
+    else:
+        out_name = new_base
+
+    status = await message.reply_text("Starting auto-rename download...")
+    try:
+        start = time.time()
+        dl_path = await message.download(file_name=os.path.join(WORKDIR, f"dl_{int(time.time())}_{out_name}"),
+                                         progress=progress_for_pyrogram,
+                                         progress_args=("Downloading…", status, start))
+    except Exception as e:
+        logger.exception("auto download failed: %s", e)
+        return await status.edit_text("❌ Download failed.")
+
+    temp_out = os.path.join(WORKDIR, f"meta_{int(time.time())}_{out_name}")
+    await status.edit_text("Applying metadata...")
+    await add_metadata(dl_path, temp_out, title=os.path.splitext(out_name)[0])
+
+    # choose thumb: rule-specific thumb > user thumb
+    thumb = chosen.get("thumb_path") or USER_THUMBS.get(uid)
+    if thumb and not os.path.exists(thumb):
+        thumb = None
+
+    caption = f"**{out_name}**"
+    await status.edit_text("Uploading...")
+    try:
+        up_start = time.time()
+        sent = None
+        if message.video:
+            sent = await message.reply_video(
+                video=temp_out,
+                caption=caption,
+                thumb=thumb if thumb else None,
+                progress=progress_for_pyrogram,
+                progress_args=("Uploading…", status, up_start)
+            )
+        else:
+            sent = await message.reply_document(
+                document=temp_out,
+                caption=caption,
+                thumb=thumb if thumb else None,
+                progress=progress_for_pyrogram,
+                progress_args=("Uploading…", status, up_start)
+            )
+    except Exception as e:
+        logger.exception("auto upload failed: %s", e)
+        await status.edit_text("❌ Upload failed.")
+        sent = None
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    # log copy
+    if LOG_CHANNEL and sent:
+        try:
+            await sent.copy(LOG_CHANNEL)
+        except Exception:
+            logger.exception("failed to copy to log channel")
+
+    # cleanup
+    for p in (dl_path, temp_out):
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+# ---------------------
+# Start/help
+# ---------------------
+HELP_TEXT = (
+    "Suto Rename Bot (Private)\n\n"
+    "Commands:\n"
+    "• /addthumbnail – reply with a photo to set\n"
+    "• /delthumbnail – delete saved thumbnail\n"
+    "• /showthumbnail – preview your thumbnail\n"
+    "• /rename <New Name> – reply to a video/file/audio (applies metadata + thumbnail)\n"
+    "• /autorename – guided setup for triggers & formats\n"
+    "• /seeformat – list your saved formats\n"
+    "• /cancel – cancel current setup\n\n"
+    "Notes:\n"
+    "• Works for videos, documents and audio.\n"
+    "• All outputs are copied to LOG_CHANNEL exactly as delivered (if set).\n"
+    "• In-memory only; rules reset on restart."
+)
+
+@app.on_message(filters.command(["start", "help"]) & filters.private)
+@owner_admin_only
+async def cmd_start_help(client: Client, message: Message):
+    await message.reply_text(HELP_TEXT)
+
+# ---------------------
+# Run
+# ---------------------
+if __name__ == "__main__":
+    if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_ID:
+        logger.error("Missing required environment variables. Exiting.")
+        print("Please set API_ID, API_HASH, BOT_TOKEN, OWNER_ID (and optionally LOG_CHANNEL).")
+        raise SystemExit(1)
+    logger.info("Starting Suto Rename Bot...")
+    app.run()
