@@ -1,657 +1,318 @@
-#!/usr/bin/env python3
-# main.py - Suto Rename Bot (single-file)
-# Requirements: pyrogram, tgcrypto. FFmpeg optional (for metadata).
-# Usage: set API_ID, API_HASH, BOT_TOKEN, OWNER_ID, optional ADMIN_IDS, LOG_CHANNEL
-
 import os
 import re
-import time
 import shutil
+import subprocess
 import asyncio
-import logging
-from typing import Dict, Any, Optional, List, Set
-from datetime import datetime
-
+from typing import Optional, Dict, Any, List
+from pymongo import MongoClient
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, ForceReply
 
-# ---------------------
-# Configuration (ENV)
-# ---------------------
-API_ID = int(os.getenv("API_ID", "22768311"))
-API_HASH = os.getenv("API_HASH", "702d8884f48b42e865425391432b3794")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "6040503076"))
-ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "5469101870")
-LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "-1003058967184"))  # 0 means disabled
-WORKDIR = os.getenv("WORKDIR", "/tmp/suto_rename")
+# ---------------- CONFIG ----------------
+from config import Config
 
-os.makedirs(WORKDIR, exist_ok=True)
+LOG_CHANNEL = int(getattr(Config, "LOG_CHANNEL", os.getenv("LOG_CHANNEL", "-1002446826368")))
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Parse ADMIN_IDS (comma separated)
-ADMIN_IDS: Set[int] = set()
-if ADMIN_IDS_ENV:
-    for x in ADMIN_IDS_ENV.split(","):
-        x = x.strip()
-        if x.isdigit():
-            ADMIN_IDS.add(int(x))
+# ---------------- MONGODB ----------------
+MONGO_URL = os.getenv("DATABASE_URL")  # Set your MongoDB URL
+mongo_client = MongoClient(MONGO_URL)
+db = mongo_client["rename_bot"]
+sessions_col = db["sessions"]
+metadata_col = db["metadata"]
+thumbnails_col = db["thumbnails"]
 
-# ffmpeg & ffprobe paths (if installed)
-FFMPEG = shutil.which("ffmpeg")
-FFPROBE = shutil.which("ffprobe")
+# ---------------- IN-MEMORY LOCKS ----------------
+PROCESSING_LOCKS: Dict[int, asyncio.Lock] = {}
 
-# ---------------------
-# Logging
-# ---------------------
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("suto_rename")
-
-# ---------------------
-# Bot client
-# ---------------------
-app = Client(
-    "suto_rename_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workdir=WORKDIR
-)
-
-# ---------------------
-# In-memory stores
-# ---------------------
-# user_id -> thumbnail file path
-USER_THUMBS: Dict[int, str] = {}
-# user_id -> list of rules: {format, trigger, channels:set[int] or None, thumb_path or None}
-AUTO_RULES: Dict[int, List[Dict[str, Any]]] = {}
-# session state for /autorename per user
-SESS: Dict[int, Dict[str, Any]] = {}
-
-# ---------------------
-# Utilities
-# ---------------------
-def is_owner_or_admin(user_id: int) -> bool:
-    return user_id == OWNER_ID or (user_id in ADMIN_IDS)
-
-def owner_admin_only(func):
-    async def wrapper(client: Client, message: Message):
-        if not message.from_user:
-            return
-        uid = message.from_user.id
-        if not is_owner_or_admin(uid):
-            try:
-                await message.reply_text("This bot is private. Access denied.")
-            except Exception:
-                pass
-            return
-        return await func(client, message)
-    return wrapper
-
-def safe_filename(name: str) -> str:
-    # replace forbidden characters in filenames
-    name = name.replace("/", "-").replace("\\", "-")
-    name = re.sub(r"[\r\n\t]+", " ", name).strip()
-    # remove multiple spaces
-    name = re.sub(r"\s+", " ", name)
-    return name
-
-EP_RE = re.compile(r"(?:E|EP|Ep|ep)(\d{1,3})")
-Q_RE = re.compile(r"\b(?:480p|720p|1080p|1440p|2160p|2K|4K)\b", re.I)
-
-def extract_episode_quality(name: str):
-    ep = None
-    q = None
-    m = EP_RE.search(name)
-    if m:
-        ep = m.group(1)
-    mq = Q_RE.search(name)
+# ---------------- HELPERS ----------------
+def parse_filename(filename: str):
+    s, e, q = None, None, None
+    patterns = [r"[Ss](\d{1,2})[Ee](\d{1,2})", r"(\d{1,2})[xX](\d{1,2})", r"[Ee](\d{1,2})"]
+    for p in patterns:
+        m = re.search(p, filename)
+        if m:
+            if len(m.groups()) == 2:
+                s, e = m.group(1).zfill(2), m.group(2).zfill(2)
+            else:
+                e = m.group(1).zfill(2)
+            break
+    mq = re.search(r"(\d{3,4}p|2k|4k|480p|720p|1080p|360p|2160p)", filename, flags=re.IGNORECASE)
     if mq:
-        q = mq.group(0)
-    return ep, q
+        q = mq.group(1).lower()
+        if q == "360p": q = "480p"
+    return {"sn": s, "ep": e, "quality": q}
 
-def apply_format(fmt: str, filename: str) -> str:
-    ep, q = extract_episode_quality(filename)
+def normalize_quality(q: Optional[str]) -> Optional[str]:
+    if not q: return None
+    q = q.lower()
+    if q == "360p": return "480p"
+    return q
+
+def build_new_filename(fmt: str, ep: Optional[str], sn: Optional[str], quality: Optional[str]):
+    ep_val = ep.zfill(2) if ep and ep.isdigit() else (ep or "")
+    sn_val = sn.zfill(2) if sn and sn.isdigit() else (sn or "")
+    quality_val = quality or ""
     out = fmt
-    out = out.replace("episode", ep or "01")
-    out = out.replace("quality", q or "480p")
+    out = out.replace("{ep}", ep_val).replace("{Sn}", sn_val).replace("{quality}", quality_val)
+    out = re.sub(r"\s+", " ", out).strip()
     return out
 
-def human_readable_bytes(size: float) -> str:
-    if size is None:
-        return "0 B"
-    power = 2**10
-    n = 0
-    units = ["B", "KB", "MB", "GB", "TB"]
-    while size > power and n < len(units)-1:
-        size /= power
-        n += 1
-    return f"{size:.2f} {units[n]}"
+def _user_temp_dir(user_id: int) -> str:
+    d = os.path.join(DOWNLOAD_DIR, str(user_id))
+    os.makedirs(d, exist_ok=True)
+    return d
 
-def time_formatter(milliseconds: int) -> str:
-    seconds = int(milliseconds / 1000)
-    minutes, sec = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    parts = []
-    if days: parts.append(f"{days}d")
-    if hours: parts.append(f"{hours}h")
-    if minutes: parts.append(f"{minutes}m")
-    if sec or not parts: parts.append(f"{sec}s")
-    return ", ".join(parts)
-
-# ---------------------
-# Progress callback (used for downloads & uploads)
-# Pyrogram will call progress(current, total, *progress_args)
-# We'll pass (label_text, status_message_obj, start_ts)
-# ---------------------
-PROG_BAR_SIZE = 20
-
-async def progress_for_pyrogram(current, total, label, status_msg: Message, start_ts):
+async def apply_metadata(src_file, dst_file, title, audio_title=None, subtitle_path=None):
+    loop = asyncio.get_event_loop()
+    def _ffmpeg_run():
+        cmd = ["ffmpeg", "-y", "-i", src_file, "-map", "0", "-c", "copy", "-metadata", f"title={title}"]
+        if audio_title:
+            cmd += ["-metadata:s:a:0", f"title={audio_title}"]
+        if subtitle_path and os.path.exists(subtitle_path):
+            cmd += ["-i", subtitle_path, "-c:s", "mov_text"]
+        cmd += [dst_file]
+        subprocess.run(cmd, check=True)
     try:
-        now = time.time()
-        diff = now - start_ts
-        if diff <= 0:
-            diff = 0.001
-        # update every ~5 seconds or when complete
-        if int(diff) % 5 == 0 or current == total:
-            percentage = (current * 100 / total) if total else 0
-            speed = current / diff
-            elapsed_ms = int(diff * 1000)
-            eta_ms = int(((total - current) / speed) * 1000) if speed > 0 else 0
-            eta_total = elapsed_ms + eta_ms
-            elapsed_fmt = time_formatter(elapsed_ms)
-            eta_fmt = time_formatter(eta_total)
-            filled = int(PROG_BAR_SIZE * percentage / 100)
-            bar = "■" * filled + "□" * (PROG_BAR_SIZE - filled)
-            msg = (
-                f"{label}\n"
-                f"`[{bar}] {percentage:.2f}%`\n"
-                f"**Done:** {human_readable_bytes(current)} / {human_readable_bytes(total)}\n"
-                f"**Speed:** {human_readable_bytes(speed)}/s\n"
-                f"**ETA:** {eta_fmt} | **Elapsed:** {elapsed_fmt}"
-            )
-            try:
-                await status_msg.edit_text(msg)
-            except Exception:
-                pass
-    except Exception:
-        # swallow any progress errors to avoid breaking operation
-        return
-
-# ---------------------
-# Metadata application (uses ffmpeg if available)
-# Attempts to copy streams and set metadata (title, encoder)
-# If ffmpeg missing or fails, fallback to simple copy
-# ---------------------
-async def add_metadata(input_path: str, output_path: str, title: Optional[str] = None) -> None:
-    """
-    Add metadata (title, encoder) using ffmpeg by copying streams.
-    If ffmpeg not available or fails, perform a plain copy.
-    """
-    try:
-        if not FFMPEG:
-            shutil.copy2(input_path, output_path)
-            return
-
-        # guess title from output filename if not provided
-        if not title:
-            title = os.path.splitext(os.path.basename(output_path))[0]
-
-        cmd = [
-            FFMPEG, "-hide_banner", "-loglevel", "error",
-            "-y", "-i", input_path,
-            "-map", "0",
-            "-c", "copy",
-            "-metadata", f"title={title}",
-            "-metadata", "encoder=SutoRenameBot",
-            output_path
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, err = await proc.communicate()
-        if proc.returncode != 0:
-            logger.warning("ffmpeg metadata addition failed: %s", err.decode(errors="ignore"))
-            # fallback copy
-            shutil.copy2(input_path, output_path)
+        await loop.run_in_executor(None, _ffmpeg_run)
+        return True
     except Exception as e:
-        logger.exception("add_metadata failed: %s", e)
+        print("Metadata error:", e)
         try:
-            shutil.copy2(input_path, output_path)
-        except Exception:
-            pass
+            shutil.copy(src_file, dst_file)
+            return True
+        except Exception as e2:
+            print("Fallback copy failed:", e2)
+            return False
 
-# ---------------------
-# Thumbnail commands
-# ---------------------
-@app.on_message(filters.command(["addthumbnail", "add_thumb"]) & filters.private)
-@owner_admin_only
-async def cmd_add_thumbnail(client: Client, message: Message):
-    if not message.reply_to_message:
-        return await message.reply_text("Reply to a photo to set as thumbnail.")
-    reply = message.reply_to_message
-    if not (reply.photo or (reply.document and str(reply.document.mime_type or "").startswith("image/"))):
-        return await message.reply_text("Reply to a photo (or image file) to set as thumbnail.")
-    status = await message.reply_text("Saving thumbnail...")
-    try:
-        start = time.time()
-        fname = os.path.join(WORKDIR, f"thumb_{message.from_user.id}.jpg")
-        path = await reply.download(file_name=fname,
-                                    progress=progress_for_pyrogram,
-                                    progress_args=("Downloading thumbnail…", status, start))
-        USER_THUMBS[message.from_user.id] = path
-        await status.edit_text("✅ Thumbnail saved.")
-    except Exception as e:
-        logger.exception("addthumbnail error: %s", e)
-        await status.edit_text("❌ Failed to save thumbnail.")
-    finally:
-        try:
-            await asyncio.sleep(0.5)
-            await status.delete()
-        except Exception:
-            pass
+async def cleanup_file(path):
+    try: os.remove(path)
+    except: pass
 
-@app.on_message(filters.command(["delthumbnail", "del_thumb"]) & filters.private)
-@owner_admin_only
-async def cmd_del_thumbnail(client: Client, message: Message):
-    uid = message.from_user.id
-    p = USER_THUMBS.pop(uid, None)
-    if p and os.path.exists(p):
-        try:
-            os.remove(p)
-        except Exception:
-            pass
-    await message.reply_text("🗑️ Thumbnail deleted (if existed).")
-
-@app.on_message(filters.command(["showthumbnail", "show_thumb"]) & filters.private)
-@owner_admin_only
-async def cmd_show_thumbnail(client: Client, message: Message):
-    p = USER_THUMBS.get(message.from_user.id)
-    if not p or not os.path.exists(p):
-        return await message.reply_text("No thumbnail set.")
-    await message.reply_photo(p, caption="Current thumbnail")
-
-# ---------------------
-# Manual /rename
-# Format: reply to media with `/rename New Name`
-# Works for video, document, audio, generic file
-# ---------------------
-@app.on_message(filters.command("rename") & filters.private)
-@owner_admin_only
-async def cmd_rename(client: Client, message: Message):
-    if len(message.command) < 2 or not message.reply_to_message:
-        return await message.reply_text("Usage: reply to a media with `/rename New Name`")
-    new_raw = message.text.split(" ", 1)[1].strip()
-    if not new_raw:
-        return await message.reply_text("Provide a new filename after /rename.")
-    new_raw = safe_filename(new_raw)
-
-    reply = message.reply_to_message
-    media = reply.video or reply.document or reply.audio
-    if not media:
-        return await message.reply_text("Reply to a video/file/audio to rename.")
-
-    # determine extension (if media has file_name)
-    orig_name = getattr(media, "file_name", None) or f"file_{int(time.time())}"
-    ext = os.path.splitext(orig_name)[1]
-    if ext and not new_raw.lower().endswith(ext.lower()):
-        out_name = f"{new_raw}{ext}"
-    else:
-        out_name = new_raw
-
-    status = await message.reply_text("Starting download...")
-    try:
-        start = time.time()
-        dl_path = await reply.download(file_name=os.path.join(WORKDIR, f"dl_{int(time.time())}_{out_name}"),
-                                       progress=progress_for_pyrogram,
-                                       progress_args=("Downloading…", status, start))
-    except Exception as e:
-        logger.exception("download failed: %s", e)
-        return await status.edit_text("❌ Download failed.")
-
-    # metadata application
-    temp_out = os.path.join(WORKDIR, f"meta_{int(time.time())}_{out_name}")
-    await status.edit_text("Applying metadata...")
-    await add_metadata(dl_path, temp_out, title=os.path.splitext(out_name)[0])
-
-    thumb = USER_THUMBS.get(message.from_user.id)
-    if thumb and not os.path.exists(thumb):
-        thumb = None
-
-    caption = f"**{out_name}**"
-    await status.edit_text("Uploading...")
-    try:
-        up_start = time.time()
-        sent = None
-        if reply.video:
-            sent = await message.reply_video(
-                video=temp_out,
-                caption=caption,
-                thumb=thumb if thumb else None,
-                progress=progress_for_pyrogram,
-                progress_args=("Uploading…", status, up_start)
-            )
-        else:
-            # document / audio / others
-            sent = await message.reply_document(
-                document=temp_out,
-                caption=caption,
-                thumb=thumb if thumb else None,
-                progress=progress_for_pyrogram,
-                progress_args=("Uploading…", status, up_start)
-            )
-    except Exception as e:
-        logger.exception("upload failed: %s", e)
-        return await status.edit_text("❌ Upload failed.")
-    finally:
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-    # forward/copy to log channel if set
-    if LOG_CHANNEL and sent:
-        try:
-            await sent.copy(LOG_CHANNEL)
-        except Exception:
-            logger.exception("failed to copy to log channel")
-
-    # cleanup
-    for p in (dl_path, temp_out):
-        try:
-            if p and os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-
-# ---------------------
-# Autorename interactive flow
-# Steps:
-# 1) /autorename -> asks for format text
-# 2) ask for trigger word(s)
-# 3) set target channels (forward messages) or /no
-# 4) set thumbnail (forward photo) or /no
-# Save in AUTO_RULES[user_id] as dict {format, trigger, channels, thumb_path}
-# ---------------------
-AWAIT_FMT = "await_format"
-AWAIT_TRIGGER = "await_trigger"
-AWAIT_TARGET = "await_target"
-AWAIT_THUMB = "await_thumb"
-
-@app.on_message(filters.command("autorename") & filters.private)
-@owner_admin_only
-async def cmd_autorename_start(client: Client, message: Message):
-    uid = message.from_user.id
-    SESS[uid] = {"state": AWAIT_FMT, "channels": set()}
-    txt = (
-        "📝 Send your custom rename format.\n\n"
-        "Example: Naruto Shippuden S02 - EPepisode - quality [Dual Audio] - @CrunchyRollChannel\n\n"
-        "📌 Available Variables:\n• episode - Episode number\n• quality - Video quality\n\n/cancel - Cancel this process"
+# ---------------- DATABASE OPERATIONS ----------------
+async def create_session(user_id: int):
+    PROCESSING_LOCKS.setdefault(user_id, asyncio.Lock())
+    sessions_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "thumbnail": None, "metadata": None, "format": None, "episodes": [], "processing": False}},
+        upsert=True
     )
-    await message.reply_text(txt)
 
-@app.on_message(filters.command("cancel") & filters.private)
-@owner_admin_only
-async def cmd_cancel(client: Client, message: Message):
-    uid = message.from_user.id
-    if uid in SESS:
-        SESS.pop(uid, None)
-    await message.reply_text("❌ Process cancelled.")
+async def get_session(user_id: int):
+    return sessions_col.find_one({"user_id": user_id})
 
-@app.on_message(filters.command("seeformat") & filters.private)
-@owner_admin_only
-async def cmd_seeformat(client: Client, message: Message):
-    uid = message.from_user.id
-    rules = AUTO_RULES.get(uid, [])
-    if not rules:
-        return await message.reply_text("No saved formats yet.")
-    lines = []
-    for i, r in enumerate(rules, 1):
-        ch = r.get("channels")
-        ch_txt = "Not Set" if not ch else ", ".join(str(x) for x in ch)
-        lines.append(
-            f"{i}.\n📝 Format: {r['format']}\n🔑 Trigger: {r['trigger']}\n📡 Channels: {ch_txt}\n🖼️ Thumbnail: {'Yes' if r.get('thumb_path') else 'No'}"
-        )
-    await message.reply_text("\n\n".join(lines))
+async def update_session(user_id: int, update: Dict[str, Any]):
+    sessions_col.update_one({"user_id": user_id}, {"$set": update})
 
-# State driver: handle text forward/photo during autorename flow
-@app.on_message(filters.private & ~filters.command(["autorename", "cancel", "seeformat", "addthumbnail", "delthumbnail", "showthumbnail", "rename"]))
-@owner_admin_only
-async def autorename_state_driver(client: Client, message: Message):
+async def add_episode_entry(user_id: int, entry: Dict[str, Any]):
+    sessions_col.update_one({"user_id": user_id}, {"$push": {"episodes": entry}})
+
+async def delete_session(user_id: int):
+    sessions_col.delete_one({"user_id": user_id})
+
+async def set_processing(user_id: int, flag: bool):
+    await update_session(user_id, {"processing": flag})
+
+async def save_user_metadata(user_id: int, text: str):
+    metadata_col.update_one({"user_id": user_id}, {"$set": {"metadata": text}}, upsert=True)
+
+async def get_user_metadata(user_id: int) -> Optional[str]:
+    doc = metadata_col.find_one({"user_id": user_id})
+    return doc.get("metadata") if doc else None
+
+async def save_user_thumbnail(user_id: int, path: str):
+    thumbnails_col.update_one({"user_id": user_id}, {"$set": {"thumbnail": path}}, upsert=True)
+
+async def get_user_thumbnail(user_id: int) -> Optional[str]:
+    doc = thumbnails_col.find_one({"user_id": user_id})
+    return doc.get("thumbnail") if doc else None
+
+async def remove_user_thumbnail(user_id: int):
+    thumbnails_col.delete_one({"user_id": user_id})
+
+# ---------------- MANUAL RENAME ----------------
+@Client.on_message(filters.private & (filters.document | filters.video))
+async def manual_rename(client, message: Message):
+    media = getattr(message, message.media.value)
+    orig_name = getattr(media, "file_name", f"file_{message.message_id}")
+    await message.reply_text(
+        f"**Please Enter New Filename...**\n\n**Old File Name:** `{orig_name}`",
+        reply_markup=ForceReply(True)
+    )
+
+@Client.on_message(filters.private & filters.reply)
+async def manual_reply(client, message: Message):
+    reply = message.reply_to_message
+    if not reply or not isinstance(reply.reply_markup, ForceReply):
+        return
+    new_name = message.text
+    await message.delete()
+    media = getattr(reply, reply.media.value)
+    ext = os.path.splitext(media.file_name)[1] or ".mkv"
+    if not new_name.endswith(ext):
+        new_name += ext
+    tmpdir = _user_temp_dir(message.from_user.id)
+    dl_path = os.path.join(tmpdir, f"{new_name}")
+    await client.download_media(media.file_id, file_name=dl_path)
+    metadata_title = await get_user_metadata(message.from_user.id)
+    out_path = os.path.join(tmpdir, f"renamed_{new_name}")
+    thumb = await get_user_thumbnail(message.from_user.id)
+    await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
+    await client.send_video(message.chat.id, out_path, caption=f"**{new_name}**",
+                            supports_streaming=True, thumb=thumb)
+    await client.send_video(LOG_CHANNEL, out_path, caption=f"**{new_name}**",
+                            supports_streaming=True, thumb=thumb)
+    await cleanup_file(dl_path)
+    await cleanup_file(out_path)
+
+# ---------------- AUTO RENAME ----------------
+@Client.on_message(filters.command("auto_rename") & filters.private)
+async def cmd_auto_rename(client, message: Message):
     uid = message.from_user.id
-    st = SESS.get(uid)
-    if not st:
+    await create_session(uid)
+    await message.reply_text("📸 Send thumbnail for auto rename or /skip to continue without it.")
+
+@Client.on_message(filters.photo & filters.private)
+async def auto_thumb_save(client, message: Message):
+    uid = message.from_user.id
+    session = await get_session(uid)
+    if not session: return
+    temp = _user_temp_dir(uid)
+    thumb_path = os.path.join(temp, "thumb.jpg")
+    await message.download(file_name=thumb_path)
+    await save_user_thumbnail(uid, thumb_path)
+    await message.reply_text("✅ Thumbnail saved! Now send metadata.")
+
+@Client.on_message(filters.command("skip") & filters.private)
+async def skip_thumb(client, message: Message):
+    await message.reply_text("✅ Skipped thumbnail. Send metadata next.")
+
+@Client.on_message(filters.text & filters.private)
+async def auto_text_handler(client, message: Message):
+    uid = message.from_user.id
+    session = await get_session(uid)
+    if not session: return
+    if not session.get("metadata"):
+        await save_user_metadata(uid, message.text)
+        await message.reply_text("✅ Metadata saved! Now send rename format with {ep} {Sn} {quality}")
+        return
+    if not session.get("format"):
+        fmt = message.text
+        await update_session(uid, {"format": fmt})
+        await message.reply_text("✅ Format saved! Now upload files.")
+
+@Client.on_message(filters.private & (filters.document | filters.video))
+async def auto_file_handler(client, message: Message):
+    uid = message.from_user.id
+    session = await get_session(uid)
+    if not session or not session.get("format"):
+        await message.reply_text("❗ Set format first with /auto_rename")
+        return
+    media = getattr(message, message.media.value)
+    orig_fname = getattr(media, "file_name", None) or f"file_{message.message_id}"
+    parsed = parse_filename(orig_fname)
+    ep = parsed.get("ep")
+    sn = parsed.get("sn")
+    quality = normalize_quality(parsed.get("quality")) or "480p"
+    file_id = media.file_id
+
+    entry = {
+        "ep": ep or "",
+        "sn": sn or "",
+        "quality": quality,
+        "file_id": file_id,
+        "orig_name": orig_fname,
+        "state": "pending"
+    }
+    await add_episode_entry(uid, entry)
+    display_ep = ep if ep else "Unknown"
+    await message.reply_text(f"📥 Saved Episode {display_ep} • {quality}")
+
+@Client.on_message(filters.command("rename_all") & filters.private)
+async def cmd_rename_all(client, message: Message):
+    uid = message.from_user.id
+    session = await get_session(uid)
+    if not session or not session.get("episodes"):
+        return await message.reply_text("❗ No active session or episodes to rename.")
+    
+    lock = PROCESSING_LOCKS.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        return await message.reply_text("⚠️ Rename already in progress. Wait.")
+    
+    await message.reply_text(f"🚀 Starting rename for {len(session.get('episodes', []))} items...")
+
+    async with lock:
+        await set_processing(uid, True)
+        try:
+            await _process_session(client, uid, message)
+        finally:
+            await set_processing(uid, False)
+            await delete_session(uid)
+            await message.reply_text("✅ All episodes renamed and uploaded successfully!")
+
+# ---------------- PROCESSING ----------------
+async def _process_session(client, user_id: int, trigger_message: Message):
+    session = await get_session(user_id)
+    if not session:
         return
 
-    state = st.get("state")
-    # 1: format
-    if state == AWAIT_FMT:
-        fmt = (message.text or "").strip()
-        if not fmt:
-            return await message.reply_text("Send the format text (plain text).")
-        st["format"] = fmt
-        st["state"] = AWAIT_TRIGGER
-        return await message.reply_text(
-            "🔑 Send the trigger word that should activate this format.\n\n"
-            "Example: naruto, anime, movies\n\n"
-            "💡 Note: If no trigger matches, you'll be prompted to rename manually.\n\n"
-            "/cancel - Cancel this process"
-        )
+    episodes = session.get("episodes", [])
+    for entry in episodes:
+        if entry.get("state") != "pending":
+            continue
+        try:
+            await _process_single_entry(client, user_id, session, entry, trigger_message)
+            entry["state"] = "done"
+        except Exception as e:
+            print("Error processing entry:", e)
+            entry["state"] = "failed"
 
-    # 2: trigger
-    if state == AWAIT_TRIGGER:
-        trig = (message.text or "").strip()
-        if not trig:
-            return await message.reply_text("Send a valid trigger word.")
-        st["trigger"] = trig
-        st["state"] = AWAIT_TARGET
-        return await message.reply_text(
-            "📥 ❪ SET TARGET CHAT ❫\n\n"
-            "➡️ Forward a message from your target chat where this format will be applied.\n\n"
-            "Available Options:\n"
-            "• Forward a message - Add specific channel\n"
-            "• /no - Skip adding any channel (apply to all)\n"
-            "• /done - Finish adding channels\n"
-            "• /cancel - Cancel the process"
-        )
-
-    # 3: target chats
-    if state == AWAIT_TARGET:
-        txt = (message.text or "").strip().lower()
-        if txt == "/no":
-            st["state"] = AWAIT_THUMB
-            return await message.reply_text(
-                "🖼️ Forward a photo for your custom thumbnail.\n\n"
-                "Options:\n• Forward/Send a photo - Set custom thumbnail\n• /no - Skip adding thumbnail\n• /cancel - Cancel this process"
-            )
-        if txt == "/done":
-            st["state"] = AWAIT_THUMB
-            return await message.reply_text(
-                "🖼️ Forward a photo for your custom thumbnail.\n\n"
-                "Options:\n• Forward/Send a photo - Set custom thumbnail\n• /no - Skip adding thumbnail\n• /cancel - Cancel this process"
-            )
-        # forwarded message adds channel
-        if message.forward_from_chat:
-            st.setdefault("channels", set()).add(message.forward_from_chat.id)
-            return await message.reply_text("✅ Target added. Forward more or send /done when finished.")
-        return await message.reply_text("Forward from the target chat, or send /no, or send /done.")
-
-    # 4: thumbnail
-    if state == AWAIT_THUMB:
-        txt = (message.text or "").strip().lower()
-        thumb_path = None
-        if txt == "/no":
-            thumb_path = None
-        elif message.photo or (message.document and str(message.document.mime_type or "").startswith("image/")):
-            ph = message.photo or message.document
-            status = await message.reply_text("Saving thumbnail...")
-            try:
-                start = time.time()
-                fname = os.path.join(WORKDIR, f"rule_thumb_{uid}_{int(time.time())}.jpg")
-                thumb_path = await ph.download(file_name=fname,
-                                               progress=progress_for_pyrogram,
-                                               progress_args=("Downloading thumbnail…", status, start))
-                await status.delete()
-            except Exception as e:
-                logger.exception("rule thumb save failed: %s", e)
-                return await status.edit_text("❌ Failed to save thumbnail.")
-        else:
-            return await message.reply_text("Send a photo or /no to skip thumbnail.")
-
-        # save rule
-        rule = {
-            "format": st.get("format"),
-            "trigger": st.get("trigger"),
-            "channels": st.get("channels") if st.get("channels") else None,
-            "thumb_path": thumb_path
-        }
-        AUTO_RULES.setdefault(uid, []).append(rule)
-        SESS.pop(uid, None)
-
-        await message.reply_text(
-            "✅ Your format has been saved successfully!\n\n"
-            f"📝 Format: {rule['format']}\n"
-            f"🔑 Trigger: {rule['trigger']}\n"
-            f"📡 Channels: {'Not Set' if not rule['channels'] else ', '.join(str(c) for c in rule['channels'])}\n"
-            f"🖼️ Thumbnail: {'Yes' if rule['thumb_path'] else 'No'}\n\n"
-            "📌 To view all your saved formats, send /seeformat"
-        )
-
-# ---------------------
-# Auto-rename handler for private media: when owner/admin sends media,
-# check rules and if a trigger matches filename, auto-apply the rule.
-# ---------------------
-@app.on_message(filters.private & (filters.video | filters.document | filters.audio))
-@owner_admin_only
-async def on_media_private(client: Client, message: Message):
-    uid = message.from_user.id
-    rules = AUTO_RULES.get(uid, [])
-    if not rules:
+async def _process_single_entry(client, user_id: int, session: Dict[str, Any], entry: Dict[str, Any], trigger_message: Message):
+    file_id = entry.get("file_id")
+    if not file_id:
         return
 
-    media = message.video or message.document or message.audio
-    base_name = getattr(media, "file_name", None) or f"media_{int(time.time())}"
-    chosen = None
-    for r in rules:
-        trig = (r.get("trigger") or "").lower()
-        chans = r.get("channels")
-        # channel scope: if set, only apply when forwarded from/coming from there
-        if chans:
-            if not message.forward_from_chat or message.forward_from_chat.id not in chans:
-                continue
-        if trig and trig in base_name.lower():
-            chosen = r
-            break
+    tmpdir = _user_temp_dir(user_id)
+    orig_name = entry.get("orig_name") or "file"
+    ext = os.path.splitext(orig_name)[1] or ".mkv"
+    dl_path = os.path.join(tmpdir, f"dl_{entry.get('ep')}_{entry.get('quality')}{ext}")
 
-    if not chosen:
-        return  # no match, do nothing (use /rename for manual)
+    await client.download_media(file_id, file_name=dl_path)
 
-    fmt = chosen["format"]
-    new_base = apply_format(fmt, base_name)
-    new_base = safe_filename(new_base)
-    suffix = os.path.splitext(base_name)[1]
-    if suffix and not new_base.lower().endswith(suffix.lower()):
-        out_name = f"{new_base}{suffix}"
+    fmt = session.get("format") or "{ep} {quality}"
+    new_name = build_new_filename(fmt, entry.get("ep"), entry.get("sn"), entry.get("quality"))
+    if not os.path.splitext(new_name)[1]:
+        new_name += ext
+    out_path = os.path.join(tmpdir, f"renamed_{new_name}")
+    metadata_title = session.get("metadata") or ""
+    thumb = await get_user_thumbnail(user_id)
+
+    await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
+
+    # Send to user & log channel
+    lowext = ext.lower()
+    caption = f"**{new_name}**"
+    if lowext in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+        await client.send_video(user_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                caption=caption, supports_streaming=True)
+        await client.send_video(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                caption=caption, supports_streaming=True)
     else:
-        out_name = new_base
+        await client.send_document(user_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                   caption=caption)
+        await client.send_document(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                   caption=caption)
 
-    status = await message.reply_text("Starting auto-rename download...")
-    try:
-        start = time.time()
-        dl_path = await message.download(file_name=os.path.join(WORKDIR, f"dl_{int(time.time())}_{out_name}"),
-                                         progress=progress_for_pyrogram,
-                                         progress_args=("Downloading…", status, start))
-    except Exception as e:
-        logger.exception("auto download failed: %s", e)
-        return await status.edit_text("❌ Download failed.")
+    await cleanup_file(dl_path)
+    await cleanup_file(out_path)
 
-    temp_out = os.path.join(WORKDIR, f"meta_{int(time.time())}_{out_name}")
-    await status.edit_text("Applying metadata...")
-    await add_metadata(dl_path, temp_out, title=os.path.splitext(out_name)[0])
-
-    # choose thumb: rule-specific thumb > user thumb
-    thumb = chosen.get("thumb_path") or USER_THUMBS.get(uid)
-    if thumb and not os.path.exists(thumb):
-        thumb = None
-
-    caption = f"**{out_name}**"
-    await status.edit_text("Uploading...")
-    try:
-        up_start = time.time()
-        sent = None
-        if message.video:
-            sent = await message.reply_video(
-                video=temp_out,
-                caption=caption,
-                thumb=thumb if thumb else None,
-                progress=progress_for_pyrogram,
-                progress_args=("Uploading…", status, up_start)
-            )
-        else:
-            sent = await message.reply_document(
-                document=temp_out,
-                caption=caption,
-                thumb=thumb if thumb else None,
-                progress=progress_for_pyrogram,
-                progress_args=("Uploading…", status, up_start)
-            )
-    except Exception as e:
-        logger.exception("auto upload failed: %s", e)
-        await status.edit_text("❌ Upload failed.")
-        sent = None
-    finally:
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-    # log copy
-    if LOG_CHANNEL and sent:
-        try:
-            await sent.copy(LOG_CHANNEL)
-        except Exception:
-            logger.exception("failed to copy to log channel")
-
-    # cleanup
-    for p in (dl_path, temp_out):
-        try:
-            if p and os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-
-# ---------------------
-# Start/help
-# ---------------------
-HELP_TEXT = (
-    "Suto Rename Bot (Private)\n\n"
-    "Commands:\n"
-    "• /addthumbnail – reply with a photo to set\n"
-    "• /delthumbnail – delete saved thumbnail\n"
-    "• /showthumbnail – preview your thumbnail\n"
-    "• /rename <New Name> – reply to a video/file/audio (applies metadata + thumbnail)\n"
-    "• /autorename – guided setup for triggers & formats\n"
-    "• /seeformat – list your saved formats\n"
-    "• /cancel – cancel current setup\n\n"
-    "Notes:\n"
-    "• Works for videos, documents and audio.\n"
-    "• All outputs are copied to LOG_CHANNEL exactly as delivered (if set).\n"
-    "• In-memory only; rules reset on restart."
-)
-
-@app.on_message(filters.command(["start", "help"]) & filters.private)
-@owner_admin_only
-async def cmd_start_help(client: Client, message: Message):
-    await message.reply_text(HELP_TEXT)
-
-# ---------------------
-# Run
-# ---------------------
+# ---------------- RUN BOT ----------------
 if __name__ == "__main__":
-    if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_ID:
-        logger.error("Missing required environment variables. Exiting.")
-        print("Please set API_ID, API_HASH, BOT_TOKEN, OWNER_ID (and optionally LOG_CHANNEL).")
-        raise SystemExit(1)
-    logger.info("Starting Suto Rename Bot...")
+    app = Client(
+        "rename_bot",
+        bot_token=Config.BOT_TOKEN,
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH
+    )
     app.run()
