@@ -11,7 +11,7 @@ from pyrogram.types import Message, ForceReply
 # ---------------- CONFIG ----------------
 BOT_TOKEN = ""
 API_ID = 22768311
-API_HASH = "702d8884f48b42e865425391432b3794"
+API_HASH = ""
 LOG_CHANNEL = 
 MONGO_URL = ""
 
@@ -25,7 +25,7 @@ sessions_col = db["sessions"]
 metadata_col = db["metadata"]
 thumbnails_col = db["thumbnails"]
 
-# ---------------- LOCKS ----------------
+# ---------------- IN-MEMORY LOCKS ----------------
 PROCESSING_LOCKS: Dict[int, asyncio.Lock] = {}
 
 # ---------------- HELPERS ----------------
@@ -56,13 +56,37 @@ def build_new_filename(fmt: str, ep: Optional[str], sn: Optional[str], quality: 
     ep_val = ep.zfill(2) if ep and ep.isdigit() else (ep or "")
     sn_val = sn.zfill(2) if sn and sn.isdigit() else (sn or "")
     quality_val = quality or ""
-    out = fmt.replace("{ep}", ep_val).replace("{Sn}", sn_val).replace("{quality}", quality_val)
-    return re.sub(r"\s+", " ", out).strip()
+    out = fmt
+    out = out.replace("{ep}", ep_val).replace("{Sn}", sn_val).replace("{quality}", quality_val)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
 
 def _user_temp_dir(user_id: int) -> str:
     d = os.path.join(DOWNLOAD_DIR, str(user_id))
     os.makedirs(d, exist_ok=True)
     return d
+
+async def apply_metadata(src_file, dst_file, title, audio_title=None, subtitle_path=None):
+    loop = asyncio.get_event_loop()
+    def _ffmpeg_run():
+        cmd = ["ffmpeg", "-y", "-i", src_file, "-map", "0", "-c", "copy", "-metadata", f"title={title}"]
+        if audio_title:
+            cmd += ["-metadata:s:a:0", f"title={audio_title}"]
+        if subtitle_path and os.path.exists(subtitle_path):
+            cmd += ["-i", subtitle_path, "-c:s", "mov_text"]
+        cmd += [dst_file]
+        subprocess.run(cmd, check=True)
+    try:
+        await loop.run_in_executor(None, _ffmpeg_run)
+        return True
+    except Exception as e:
+        print("Metadata error:", e)
+        try:
+            shutil.copy(src_file, dst_file)
+            return True
+        except Exception as e2:
+            print("Fallback copy failed:", e2)
+            return False
 
 async def cleanup_file(path):
     try: os.remove(path)
@@ -109,49 +133,7 @@ async def get_user_thumbnail(user_id: int) -> Optional[str]:
 async def remove_user_thumbnail(user_id: int):
     thumbnails_col.delete_one({"user_id": user_id})
 
-# ---------------- PROGRESS ----------------
-def progress_bar(current, total, length=20):
-    percent = int(current / total * 100)
-    bar = "█" * (percent // (100 // length)) + "░" * (length - percent // (100 // length))
-    return f"[{bar}] {percent}%"
-
-async def download_with_progress(client, file_id, file_path, chat_id):
-    msg = await client.send_message(chat_id, f"⬇️ Starting download...")
-    def callback(current, total):
-        bar = progress_bar(current, total)
-        asyncio.create_task(client.edit_message_text(chat_id, msg.message_id, f"⬇️ Downloading...\n{bar}"))
-    await client.download_media(file_id, file_name=file_path, progress=callback)
-    await msg.edit_text("✅ Download completed!")
-    return msg
-
-async def upload_with_progress(client, chat_id, file_path, caption, thumb):
-    msg = await client.send_message(chat_id, "🚀 Starting upload...")
-    def callback(current, total):
-        bar = progress_bar(current, total)
-        asyncio.create_task(client.edit_message_text(chat_id, msg.message_id, f"🚀 Uploading...\n{bar}"))
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in [".mp4", ".mkv", ".mov", ".webm", ".avi"]:
-        await client.send_video(chat_id, file_path, caption=caption, thumb=thumb, supports_streaming=True, progress=callback)
-    else:
-        await client.send_document(chat_id, file_path, caption=caption, thumb=thumb, progress=callback)
-    await msg.delete()
-
-async def apply_metadata_with_progress(src, dst, title, audio_title=None, chat_id=None):
-    loop = asyncio.get_event_loop()
-    def _ffmpeg_run():
-        cmd = ["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-metadata", f"title={title}"]
-        if audio_title:
-            cmd += ["-metadata:s:a:0", f"title={audio_title}"]
-        cmd += [dst]
-        subprocess.run(cmd, check=True)
-    if chat_id:
-        msg = await app.send_message(chat_id, "⏳ Applying metadata...")
-        await loop.run_in_executor(None, _ffmpeg_run)
-        await msg.edit_text("✅ Metadata applied!")
-    else:
-        await loop.run_in_executor(None, _ffmpeg_run)
-
-# ---------------- CLIENT ----------------
+# ---------------- BOT ----------------
 app = Client("rename_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 # ---------------- START ----------------
@@ -171,8 +153,15 @@ async def start_handler(client, message):
 # ---------------- MANUAL RENAME ----------------
 @app.on_message(filters.private & (filters.document | filters.video))
 async def manual_rename(client, message: Message):
-    media = message.document or message.video
-    orig_name = getattr(media, "file_name", f"file_{message.message_id}")
+    if message.document:
+        media = message.document
+    elif message.video:
+        media = message.video
+    else:
+        await message.reply_text("❌ Unsupported media type.")
+        return
+
+    orig_name = getattr(media, "file_name", f"file_{message.id}")
     await message.reply_text(
         f"**Please Enter New Filename...**\n\n**Old File Name:** `{orig_name}`",
         reply_markup=ForceReply(True)
@@ -183,25 +172,38 @@ async def manual_reply(client, message: Message):
     reply = message.reply_to_message
     if not reply or not isinstance(reply.reply_markup, ForceReply):
         return
+
     new_name = message.text
-    media = reply.document or reply.video
-    ext = os.path.splitext(getattr(media, "file_name", ""))[1] or ".mkv"
+    await message.delete()
+
+    # Safe media extraction
+    if reply.document:
+        media = reply.document
+    elif reply.video:
+        media = reply.video
+    else:
+        await message.reply_text("❌ Original message has no valid media.")
+        return
+
+    ext = os.path.splitext(getattr(media, "file_name", "file.mkv"))[1] or ".mkv"
     if not new_name.endswith(ext):
         new_name += ext
 
     tmpdir = _user_temp_dir(message.from_user.id)
     dl_path = os.path.join(tmpdir, f"{new_name}")
-    await download_with_progress(client, media.file_id, dl_path, message.chat.id)
+    await client.download_media(media.file_id, file_name=dl_path)
 
     metadata_title = await get_user_metadata(message.from_user.id)
     out_path = os.path.join(tmpdir, f"renamed_{new_name}")
     thumb = await get_user_thumbnail(message.from_user.id)
-    await apply_metadata_with_progress(dl_path, out_path, title=new_name, audio_title=metadata_title, chat_id=message.chat.id)
-    
-    # Upload to log channel first
-    await upload_with_progress(client, LOG_CHANNEL, out_path, f"**{new_name}**", thumb)
-    await upload_with_progress(client, message.chat.id, out_path, f"**{new_name}**", thumb)
-    
+
+    await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
+
+    await client.send_video(message.chat.id, out_path, caption=f"**{new_name}**",
+                            supports_streaming=True, thumb=thumb)
+    await client.send_video(LOG_CHANNEL, out_path, caption=f"**{new_name}**",
+                            supports_streaming=True, thumb=thumb)
+
     await cleanup_file(dl_path)
     await cleanup_file(out_path)
 
@@ -225,19 +227,27 @@ async def auto_thumb_save(client, message: Message):
 
 @app.on_message(filters.command("skip") & filters.private)
 async def skip_thumb(client, message: Message):
-    await message.reply_text("✅ Skipped thumbnail. Now send metadata.")
+    await message.reply_text("✅ Skipped thumbnail. Send metadata next.")
 
+@app.on_message(filters.command("metadata") & filters.private)
+async def set_metadata(client, message: Message):
+    uid = message.from_user.id
+    txt = message.text.split(" ", 1)
+    if len(txt) < 2:
+        await message.reply_text("❌ Usage: /metadata Your metadata text here")
+        return
+    await save_user_metadata(uid, txt[1])
+    await message.reply_text("✅ Metadata saved! Now send rename format using {ep}, {Sn}, {quality}.")
+
+# ---------------- TEXT HANDLER ----------------
 @app.on_message(filters.text & filters.private)
 async def auto_text_handler(client, message: Message):
+    if message.text.startswith("/"):
+        return
+
     uid = message.from_user.id
     session = await get_session(uid)
     if not session: return
-
-    if not session.get("metadata"):
-        await save_user_metadata(uid, message.text)
-        await update_session(uid, {"metadata": message.text})
-        await message.reply_text("✅ Metadata saved! Now send rename format using {ep}, {Sn}, {quality}.")
-        return
 
     if not session.get("format"):
         fmt = message.text
@@ -250,11 +260,18 @@ async def auto_file_handler(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
     if not session or not session.get("format"):
-        await message.reply_text("❗ Set format first with /auto_rename and metadata")
+        await message.reply_text("❗ Set format first with /auto_rename")
         return
 
-    media = message.document or message.video
-    orig_fname = getattr(media, "file_name", f"file_{message.message_id}")
+    if message.document:
+        media = message.document
+    elif message.video:
+        media = message.video
+    else:
+        await message.reply_text("❌ Unsupported media type.")
+        return
+
+    orig_fname = getattr(media, "file_name", f"file_{message.id}")
     parsed = parse_filename(orig_fname)
     ep = parsed.get("ep")
     sn = parsed.get("sn")
@@ -270,26 +287,26 @@ async def auto_file_handler(client, message: Message):
     }
     await add_episode_entry(uid, entry)
     display_ep = ep if ep else "Unknown"
-    await message.reply_text(f"📥 Saved Episode {display_ep} • {quality} for auto rename.")
+    await message.reply_text(f"📥 Saved Episode {display_ep} • {quality}")
 
 # ---------------- RENAME ALL ----------------
 @app.on_message(filters.command("rename_all") & filters.private)
 async def cmd_rename_all(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
-    episodes = session.get("episodes", [])
-    if not session or not episodes:
+    if not session or not session.get("episodes"):
         return await message.reply_text("❗ No active session or episodes to rename.")
 
     lock = PROCESSING_LOCKS.setdefault(uid, asyncio.Lock())
     if lock.locked():
-        return await message.reply_text("⚠️ Rename already in progress. Please wait.")
+        return await message.reply_text("⚠️ Rename already in progress. Wait.")
 
-    await message.reply_text(f"🚀 Starting rename for {len(episodes)} files...")
+    await message.reply_text(f"🚀 Starting rename for {len(session.get('episodes', []))} items...")
 
     async with lock:
         await set_processing(uid, True)
         try:
+            episodes = session.get("episodes", [])
             for entry in episodes:
                 if entry.get("state") != "pending":
                     continue
@@ -311,31 +328,35 @@ async def process_single_entry(client, user_id, session, entry, chat_id):
     ext = os.path.splitext(orig_name)[1] or ".mkv"
     dl_path = os.path.join(tmpdir, f"dl_{entry.get('ep')}_{entry.get('quality')}{ext}")
 
-    # Download file with progress
-    await download_with_progress(client, entry.get("file_id"), dl_path, chat_id)
+    await client.download_media(entry.get("file_id"), file_name=dl_path)
 
-    # Build new filename
     fmt = session.get("format") or "{ep} {quality}"
     new_name = build_new_filename(fmt, entry.get("ep"), entry.get("sn"), entry.get("quality"))
     if not os.path.splitext(new_name)[1]:
         new_name += ext
     out_path = os.path.join(tmpdir, f"renamed_{new_name}")
 
-    # Apply metadata with progress
     metadata_title = session.get("metadata") or ""
     thumb = session.get("thumbnail")
-    await apply_metadata_with_progress(dl_path, out_path, title=new_name, audio_title=metadata_title, chat_id=chat_id)
 
-    # Upload to log channel first
-    await upload_with_progress(client, LOG_CHANNEL, out_path, f"**{new_name}**", thumb if thumb and os.path.exists(thumb) else None)
-    # Upload to user
-    await upload_with_progress(client, chat_id, out_path, f"**{new_name}**", thumb if thumb and os.path.exists(thumb) else None)
+    await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
 
-    # Cleanup temp files
+    caption = f"**{new_name}**"
+    if ext.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+        await client.send_video(chat_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                caption=caption, supports_streaming=True)
+        await client.send_video(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                caption=caption, supports_streaming=True)
+    else:
+        await client.send_document(chat_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                   caption=caption)
+        await client.send_document(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
+                                   caption=caption)
+
     await cleanup_file(dl_path)
     await cleanup_file(out_path)
 
-# ---------------- THUMBNAIL MANAGEMENT ----------------
+# ---------------- THUMBNAIL ----------------
 @app.on_message(filters.command("view_thumb") & filters.private)
 async def view_thumbnail(client, message: Message):
     uid = message.from_user.id
@@ -370,6 +391,6 @@ async def reset_session(client, message: Message):
     await update_session(uid, {"format": None})
     await message.reply_text("♻️ Your session has been reset successfully!")
 
-# ---------------- RUN BOT ----------------
+# ---------------- RUN ----------------
 print("✅ Bot is starting...")
 app.run()
