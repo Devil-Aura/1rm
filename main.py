@@ -3,20 +3,22 @@ import re
 import shutil
 import subprocess
 import asyncio
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from pymongo import MongoClient
 from pyrogram import Client, filters
 from pyrogram.types import Message, ForceReply
 
-# ---------------- CONFIG ----------------
-from config import Config
+# ---------------- CONFIG (All in one file) ----------------
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # Replace with your bot token
+API_ID = 123456                      # Replace with your API ID
+API_HASH = "YOUR_API_HASH_HERE"      # Replace with your API HASH
+LOG_CHANNEL = -1001234567890         # Replace with your log channel ID
+MONGO_URL = "YOUR_MONGODB_URL"       # Replace with MongoDB URL
 
-LOG_CHANNEL = int(getattr(Config, "LOG_CHANNEL", os.getenv("LOG_CHANNEL", "-1002446826368")))
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ---------------- MONGODB ----------------
-MONGO_URL = os.getenv("DATABASE_URL")  # Set your MongoDB URL
 mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["rename_bot"]
 sessions_col = db["sessions"]
@@ -131,8 +133,18 @@ async def get_user_thumbnail(user_id: int) -> Optional[str]:
 async def remove_user_thumbnail(user_id: int):
     thumbnails_col.delete_one({"user_id": user_id})
 
+# ---------------- START HANDLER ----------------
+app = Client("rename_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+
+@app.on_message(filters.private & filters.command("start"))
+async def start_handler(client, message):
+    await message.reply_text(
+        "👋 Hello! I am your Rename Bot.\n\n"
+        "Use /auto_rename to start automatic renaming or send a video/document for manual rename."
+    )
+
 # ---------------- MANUAL RENAME ----------------
-@Client.on_message(filters.private & (filters.document | filters.video))
+@app.on_message(filters.private & (filters.document | filters.video))
 async def manual_rename(client, message: Message):
     media = getattr(message, message.media.value)
     orig_name = getattr(media, "file_name", f"file_{message.message_id}")
@@ -141,7 +153,7 @@ async def manual_rename(client, message: Message):
         reply_markup=ForceReply(True)
     )
 
-@Client.on_message(filters.private & filters.reply)
+@app.on_message(filters.private & filters.reply)
 async def manual_reply(client, message: Message):
     reply = message.reply_to_message
     if not reply or not isinstance(reply.reply_markup, ForceReply):
@@ -167,13 +179,13 @@ async def manual_reply(client, message: Message):
     await cleanup_file(out_path)
 
 # ---------------- AUTO RENAME ----------------
-@Client.on_message(filters.command("auto_rename") & filters.private)
+@app.on_message(filters.command("auto_rename") & filters.private)
 async def cmd_auto_rename(client, message: Message):
     uid = message.from_user.id
     await create_session(uid)
     await message.reply_text("📸 Send thumbnail for auto rename or /skip to continue without it.")
 
-@Client.on_message(filters.photo & filters.private)
+@app.on_message(filters.photo & filters.private)
 async def auto_thumb_save(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
@@ -184,11 +196,11 @@ async def auto_thumb_save(client, message: Message):
     await save_user_thumbnail(uid, thumb_path)
     await message.reply_text("✅ Thumbnail saved! Now send metadata.")
 
-@Client.on_message(filters.command("skip") & filters.private)
+@app.on_message(filters.command("skip") & filters.private)
 async def skip_thumb(client, message: Message):
     await message.reply_text("✅ Skipped thumbnail. Send metadata next.")
 
-@Client.on_message(filters.text & filters.private)
+@app.on_message(filters.text & filters.private)
 async def auto_text_handler(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
@@ -202,7 +214,7 @@ async def auto_text_handler(client, message: Message):
         await update_session(uid, {"format": fmt})
         await message.reply_text("✅ Format saved! Now upload files.")
 
-@Client.on_message(filters.private & (filters.document | filters.video))
+@app.on_message(filters.private & (filters.document | filters.video))
 async def auto_file_handler(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
@@ -229,17 +241,17 @@ async def auto_file_handler(client, message: Message):
     display_ep = ep if ep else "Unknown"
     await message.reply_text(f"📥 Saved Episode {display_ep} • {quality}")
 
-@Client.on_message(filters.command("rename_all") & filters.private)
+@app.on_message(filters.command("rename_all") & filters.private)
 async def cmd_rename_all(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
     if not session or not session.get("episodes"):
         return await message.reply_text("❗ No active session or episodes to rename.")
-    
+
     lock = PROCESSING_LOCKS.setdefault(uid, asyncio.Lock())
     if lock.locked():
         return await message.reply_text("⚠️ Rename already in progress. Wait.")
-    
+
     await message.reply_text(f"🚀 Starting rename for {len(session.get('episodes', []))} items...")
 
     async with lock:
@@ -286,14 +298,12 @@ async def _process_single_entry(client, user_id: int, session: Dict[str, Any], e
         new_name += ext
     out_path = os.path.join(tmpdir, f"renamed_{new_name}")
     metadata_title = session.get("metadata") or ""
-    thumb = await get_user_thumbnail(user_id)
+    thumb = session.get("thumbnail")
 
     await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
 
-    # Send to user & log channel
-    lowext = ext.lower()
     caption = f"**{new_name}**"
-    if lowext in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+    if ext.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
         await client.send_video(user_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
                                 caption=caption, supports_streaming=True)
         await client.send_video(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
@@ -308,11 +318,5 @@ async def _process_single_entry(client, user_id: int, session: Dict[str, Any], e
     await cleanup_file(out_path)
 
 # ---------------- RUN BOT ----------------
-if __name__ == "__main__":
-    app = Client(
-        "rename_bot",
-        bot_token=Config.BOT_TOKEN,
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH
-    )
-    app.run()
+print("✅ Bot is starting...")
+app.run()
