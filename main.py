@@ -10,7 +10,7 @@ from pyrogram.types import Message, ForceReply
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = ""
-API_ID = 22768311
+API_ID = 
 API_HASH = ""
 LOG_CHANNEL = 
 MONGO_URL = ""
@@ -25,7 +25,7 @@ sessions_col = db["sessions"]
 metadata_col = db["metadata"]
 thumbnails_col = db["thumbnails"]
 
-# ---------------- IN-MEMORY LOCKS ----------------
+# ---------------- LOCKS ----------------
 PROCESSING_LOCKS: Dict[int, asyncio.Lock] = {}
 
 # ---------------- HELPERS ----------------
@@ -92,7 +92,7 @@ async def cleanup_file(path):
     try: os.remove(path)
     except: pass
 
-# ---------------- DATABASE ----------------
+# ---------------- DATABASE OPERATIONS ----------------
 async def create_session(user_id: int):
     PROCESSING_LOCKS.setdefault(user_id, asyncio.Lock())
     sessions_col.update_one(
@@ -133,10 +133,18 @@ async def get_user_thumbnail(user_id: int) -> Optional[str]:
 async def remove_user_thumbnail(user_id: int):
     thumbnails_col.delete_one({"user_id": user_id})
 
+# ---------------- PROGRESS ----------------
+async def progress(current, total, chat_id, message_id, prefix="Progress"):
+    now = int(current / total * 100)
+    text = f"{prefix}: {now}% [{current}/{total}]"
+    try:
+        await app.edit_message_text(chat_id, message_id, text)
+    except: pass
+
 # ---------------- BOT ----------------
 app = Client("rename_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
-# ---------------- START ----------------
+# ---------------- COMMANDS ----------------
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client, message):
     await message.reply_text(
@@ -150,17 +158,41 @@ async def start_handler(client, message):
         "/reset_session - Reset all saved data"
     )
 
+@app.on_message(filters.command("view_thumb") & filters.private)
+async def view_thumb(client, message):
+    thumb = await get_user_thumbnail(message.from_user.id)
+    if thumb and os.path.exists(thumb):
+        await client.send_photo(message.chat.id, thumb, caption="📸 Saved Thumbnail")
+    else:
+        await message.reply_text("❌ No thumbnail saved.")
+
+@app.on_message(filters.command("delete_thumb") & filters.private)
+async def delete_thumb(client, message):
+    await remove_user_thumbnail(message.from_user.id)
+    await message.reply_text("✅ Thumbnail deleted.")
+
+@app.on_message(filters.command("reset_session") & filters.private)
+async def reset_session(client, message):
+    uid = message.from_user.id
+    await delete_session(uid)
+    await remove_user_thumbnail(uid)
+    await save_user_metadata(uid, "")
+    await message.reply_text("✅ All session data reset.")
+
+@app.on_message(filters.command("metadata") & filters.private)
+async def set_metadata(client, message):
+    uid = message.from_user.id
+    text = message.text.split(None, 1)
+    if len(text) < 2:
+        await message.reply_text("Send as: /metadata Your Metadata Here")
+        return
+    await save_user_metadata(uid, text[1])
+    await message.reply_text("✅ Metadata saved!")
+
 # ---------------- MANUAL RENAME ----------------
 @app.on_message(filters.private & (filters.document | filters.video))
 async def manual_rename(client, message: Message):
-    if message.document:
-        media = message.document
-    elif message.video:
-        media = message.video
-    else:
-        await message.reply_text("❌ Unsupported media type.")
-        return
-
+    media = getattr(message, message.media.value)
     orig_name = getattr(media, "file_name", f"file_{message.id}")
     await message.reply_text(
         f"**Please Enter New Filename...**\n\n**Old File Name:** `{orig_name}`",
@@ -172,38 +204,23 @@ async def manual_reply(client, message: Message):
     reply = message.reply_to_message
     if not reply or not isinstance(reply.reply_markup, ForceReply):
         return
-
     new_name = message.text
     await message.delete()
-
-    # Safe media extraction
-    if reply.document:
-        media = reply.document
-    elif reply.video:
-        media = reply.video
-    else:
-        await message.reply_text("❌ Original message has no valid media.")
-        return
-
-    ext = os.path.splitext(getattr(media, "file_name", "file.mkv"))[1] or ".mkv"
+    media = getattr(reply, reply.media.value)
+    ext = os.path.splitext(media.file_name)[1] or ".mkv"
     if not new_name.endswith(ext):
         new_name += ext
-
     tmpdir = _user_temp_dir(message.from_user.id)
     dl_path = os.path.join(tmpdir, f"{new_name}")
     await client.download_media(media.file_id, file_name=dl_path)
-
     metadata_title = await get_user_metadata(message.from_user.id)
     out_path = os.path.join(tmpdir, f"renamed_{new_name}")
     thumb = await get_user_thumbnail(message.from_user.id)
-
     await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
-
     await client.send_video(message.chat.id, out_path, caption=f"**{new_name}**",
                             supports_streaming=True, thumb=thumb)
     await client.send_video(LOG_CHANNEL, out_path, caption=f"**{new_name}**",
                             supports_streaming=True, thumb=thumb)
-
     await cleanup_file(dl_path)
     await cleanup_file(out_path)
 
@@ -223,65 +240,48 @@ async def auto_thumb_save(client, message: Message):
     thumb_path = os.path.join(temp, "thumb.jpg")
     await message.download(file_name=thumb_path)
     await save_user_thumbnail(uid, thumb_path)
-    await message.reply_text("✅ Thumbnail saved! Now send metadata.")
+    await message.reply_text("✅ Thumbnail saved! Now send metadata using /metadata command.")
 
 @app.on_message(filters.command("skip") & filters.private)
 async def skip_thumb(client, message: Message):
-    await message.reply_text("✅ Skipped thumbnail. Send metadata next.")
+    await message.reply_text("✅ Skipped thumbnail. Send metadata next using /metadata command.")
 
-@app.on_message(filters.command("metadata") & filters.private)
-async def set_metadata(client, message: Message):
-    uid = message.from_user.id
-    txt = message.text.split(" ", 1)
-    if len(txt) < 2:
-        await message.reply_text("❌ Usage: /metadata Your metadata text here")
-        return
-    await save_user_metadata(uid, txt[1])
-    await message.reply_text("✅ Metadata saved! Now send rename format using {ep}, {Sn}, {quality}.")
-
-# ---------------- TEXT HANDLER ----------------
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.private & filters.text)
 async def auto_text_handler(client, message: Message):
-    if message.text.startswith("/"):
-        return
-
     uid = message.from_user.id
     session = await get_session(uid)
     if not session: return
-
+    # Save metadata if not set
+    if not session.get("metadata"):
+        await save_user_metadata(uid, message.text)
+        await message.reply_text("✅ Metadata saved! Now send rename format using {ep} {Sn} {quality}")
+        return
+    # Save format if not set
     if not session.get("format"):
         fmt = message.text
         await update_session(uid, {"format": fmt})
-        await message.reply_text("✅ Format saved! Now upload your files for auto rename.")
+        await message.reply_text("✅ Format saved! Now upload your video/files.")
 
-# ---------------- AUTO FILE HANDLER ----------------
 @app.on_message(filters.private & (filters.document | filters.video))
 async def auto_file_handler(client, message: Message):
     uid = message.from_user.id
     session = await get_session(uid)
     if not session or not session.get("format"):
-        await message.reply_text("❗ Set format first with /auto_rename")
+        await message.reply_text("❗ Set format first with /auto_rename and send format text.")
         return
-
-    if message.document:
-        media = message.document
-    elif message.video:
-        media = message.video
-    else:
-        await message.reply_text("❌ Unsupported media type.")
-        return
-
-    orig_fname = getattr(media, "file_name", f"file_{message.id}")
+    media = getattr(message, message.media.value)
+    orig_fname = getattr(media, "file_name", None) or f"file_{message.id}"
     parsed = parse_filename(orig_fname)
     ep = parsed.get("ep")
     sn = parsed.get("sn")
     quality = normalize_quality(parsed.get("quality")) or "480p"
+    file_id = media.file_id
 
     entry = {
         "ep": ep or "",
         "sn": sn or "",
         "quality": quality,
-        "file_id": media.file_id,
+        "file_id": file_id,
         "orig_name": orig_fname,
         "state": "pending"
     }
@@ -289,7 +289,6 @@ async def auto_file_handler(client, message: Message):
     display_ep = ep if ep else "Unknown"
     await message.reply_text(f"📥 Saved Episode {display_ep} • {quality}")
 
-# ---------------- RENAME ALL ----------------
 @app.on_message(filters.command("rename_all") & filters.private)
 async def cmd_rename_all(client, message: Message):
     uid = message.from_user.id
@@ -306,30 +305,44 @@ async def cmd_rename_all(client, message: Message):
     async with lock:
         await set_processing(uid, True)
         try:
-            episodes = session.get("episodes", [])
-            for entry in episodes:
-                if entry.get("state") != "pending":
-                    continue
-                try:
-                    await process_single_entry(client, uid, session, entry, message.chat.id)
-                    entry["state"] = "done"
-                except Exception as e:
-                    print("Error processing entry:", e)
-                    entry["state"] = "failed"
+            await _process_session(client, uid, message)
         finally:
             await set_processing(uid, False)
             await delete_session(uid)
             await message.reply_text("✅ All episodes renamed and uploaded successfully!")
 
-# ---------------- PROCESS SINGLE ENTRY ----------------
-async def process_single_entry(client, user_id, session, entry, chat_id):
+# ---------------- PROCESSING ----------------
+async def _process_session(client, user_id: int, trigger_message: Message):
+    session = await get_session(user_id)
+    if not session:
+        return
+    episodes = session.get("episodes", [])
+    for i, entry in enumerate(episodes, 1):
+        if entry.get("state") != "pending":
+            continue
+        try:
+            await _process_single_entry(client, user_id, session, entry, trigger_message, index=i, total=len(episodes))
+            entry["state"] = "done"
+        except Exception as e:
+            print("Error processing entry:", e)
+            entry["state"] = "failed"
+
+async def _process_single_entry(client, user_id: int, session: Dict[str, Any], entry: Dict[str, Any], trigger_message: Message, index=1, total=1):
+    file_id = entry.get("file_id")
+    if not file_id:
+        return
+
     tmpdir = _user_temp_dir(user_id)
     orig_name = entry.get("orig_name") or "file"
     ext = os.path.splitext(orig_name)[1] or ".mkv"
     dl_path = os.path.join(tmpdir, f"dl_{entry.get('ep')}_{entry.get('quality')}{ext}")
 
-    await client.download_media(entry.get("file_id"), file_name=dl_path)
+    # Download with progress
+    msg = await client.send_message(user_id, f"⬇️ Downloading {orig_name} ({index}/{total})")
+    await client.download_media(file_id, file_name=dl_path, progress=lambda c, t: asyncio.create_task(progress(c, t, user_id, msg.id, "Downloading")))
+    await msg.edit_text(f"✅ Downloaded {orig_name}")
 
+    # Build new filename
     fmt = session.get("format") or "{ep} {quality}"
     new_name = build_new_filename(fmt, entry.get("ep"), entry.get("sn"), entry.get("quality"))
     if not os.path.splitext(new_name)[1]:
@@ -339,58 +352,27 @@ async def process_single_entry(client, user_id, session, entry, chat_id):
     metadata_title = session.get("metadata") or ""
     thumb = session.get("thumbnail")
 
+    # Apply metadata
+    msg_meta = await client.send_message(user_id, f"🔧 Applying metadata to {new_name}")
     await apply_metadata(dl_path, out_path, title=new_name, audio_title=metadata_title)
+    await msg_meta.edit_text(f"✅ Metadata applied for {new_name}")
 
     caption = f"**{new_name}**"
-    if ext.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
-        await client.send_video(chat_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
-                                caption=caption, supports_streaming=True)
-        await client.send_video(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
-                                caption=caption, supports_streaming=True)
-    else:
-        await client.send_document(chat_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
-                                   caption=caption)
-        await client.send_document(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None,
-                                   caption=caption)
 
+    # Send to user and log channel
+    if ext.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+        msg_upload = await client.send_message(user_id, f"⬆️ Uploading {new_name}")
+        await client.send_video(user_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None, caption=caption, supports_streaming=True)
+        await client.send_video(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None, caption=caption, supports_streaming=True)
+        await msg_upload.edit_text(f"✅ Uploaded {new_name}")
+    else:
+        await client.send_document(user_id, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None, caption=caption)
+        await client.send_document(LOG_CHANNEL, out_path, thumb=thumb if thumb and os.path.exists(thumb) else None, caption=caption)
+
+    # Cleanup
     await cleanup_file(dl_path)
     await cleanup_file(out_path)
 
-# ---------------- THUMBNAIL ----------------
-@app.on_message(filters.command("view_thumb") & filters.private)
-async def view_thumbnail(client, message: Message):
-    uid = message.from_user.id
-    thumb = await get_user_thumbnail(uid)
-    if thumb and os.path.exists(thumb):
-        await client.send_photo(message.chat.id, thumb, caption="📸 Your saved thumbnail.")
-    else:
-        await message.reply_text("❌ No thumbnail saved.")
-
-@app.on_message(filters.command("delete_thumb") & filters.private)
-async def delete_thumbnail(client, message: Message):
-    uid = message.from_user.id
-    thumb = await get_user_thumbnail(uid)
-    if thumb and os.path.exists(thumb):
-        await cleanup_file(thumb)
-    await remove_user_thumbnail(uid)
-    await message.reply_text("✅ Thumbnail deleted successfully!")
-
-# ---------------- RESET SESSION ----------------
-@app.on_message(filters.command("reset_session") & filters.private)
-async def reset_session(client, message: Message):
-    uid = message.from_user.id
-    session = await get_session(uid)
-    if session:
-        tmpdir = _user_temp_dir(uid)
-        try:
-            shutil.rmtree(tmpdir)
-        except: pass
-        await delete_session(uid)
-    await remove_user_thumbnail(uid)
-    await save_user_metadata(uid, "")
-    await update_session(uid, {"format": None})
-    await message.reply_text("♻️ Your session has been reset successfully!")
-
-# ---------------- RUN ----------------
+# ---------------- RUN BOT ----------------
 print("✅ Bot is starting...")
 app.run()
