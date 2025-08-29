@@ -9,11 +9,11 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, ForceReply
 
 # ---------------- CONFIG (All in one file) ----------------
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # Replace with your bot token
-API_ID = 123456                      # Replace with your API ID
-API_HASH = "YOUR_API_HASH_HERE"      # Replace with your API HASH
-LOG_CHANNEL = -1001234567890         # Replace with your log channel ID
-MONGO_URL = "YOUR_MONGODB_URL"       # Replace with MongoDB URL
+BOT_TOKEN = ""   # Replace with your bot token
+API_ID =                     # Replace with your API ID
+API_HASH = ""      # Replace with your API HASH
+LOG_CHANNEL =          # Replace with your log channel ID
+MONGO_URL = ""       # Replace with MongoDB URL
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
